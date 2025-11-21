@@ -102,9 +102,8 @@ def main():
         accelerator.native_amp = False
 
     # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.project_dir is not None:
-            os.makedirs(args.project_dir, exist_ok=True)
+    if args.project_dir is not None:
+        os.makedirs(args.project_dir, exist_ok=True)
 
     # Make one log on every process with the configuration for debugging.
     accelerator.wait_for_everyone()

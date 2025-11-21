@@ -169,6 +169,10 @@ def main():
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
 
+    # Handle the repository creation
+    if args.project_dir is not None:
+        os.makedirs(args.project_dir, exist_ok=True)
+
     # Make one log on every process with the configuration for debugging.
     accelerator.wait_for_everyone()
     logging.basicConfig(
@@ -192,11 +196,6 @@ def main():
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
-
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.project_dir is not None:
-            os.makedirs(args.project_dir, exist_ok=True)
 
     # Load the tokenizers
     tokenizer_one = AutoTokenizer.from_pretrained(
