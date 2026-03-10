@@ -38,7 +38,14 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DPMSolverMultistepScheduler, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL, 
+    DDPMScheduler, 
+    DPMSolverMultistepScheduler, 
+    ControlNetModel,
+    UNet2DConditionModel
+)
+
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -46,7 +53,6 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import re
 import pickle
-from dice_sharpener import Sharpener
 from torchvision.utils import make_grid, save_image
 from pipelines.pipeline_stable_diffusion import StableDiffusionPipeline
 from torch_utils.arg_parser import parse_args
@@ -79,7 +85,9 @@ def main():
 
     # Description string.
     total_batch_size = args.train_batch_size * args.n_gpus * args.gradient_accumulation_steps
-    desc = f'sd15-{args.max_train_steps}-batch{total_batch_size}-cfg{args.guidance_scale}'
+    desc = f'sd15-{args.max_train_steps}-batch{total_batch_size}'
+    if args.guidance_scale is not None: desc += f'-cfg{args.guidance_scale}'
+    desc += '-pnp'
     prev_run_dirs = []
     if os.path.isdir(args.output_dir):
         prev_run_dirs = [x for x in os.listdir(args.output_dir) if os.path.isdir(os.path.join(args.output_dir, x))]
@@ -130,52 +138,19 @@ def main():
         set_seed(args.seed)
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
-
-    def deepspeed_zero_init_disabled_context_manager():
-        """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
-        """
-        deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
-        if deepspeed_plugin is None:
-            return []
-
-        return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
-
-    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # will try to assign the same optimizer with the same weights to all models during
-    # `deepspeed.initialize`, which of course doesn't work.
-    #
-    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # frozen models from being partitioned during `zero.Init` which gets called during
-    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
-    with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        text_encoder = CLIPTextModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-        )
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-        )
-        unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet"
-        )
-
-    sharpener = Sharpener(input_dim=768, output_dim=768, inner_dim=512, nhead=8)
-    sharpener.train().requires_grad_(True)
-    # Check model parameters
-    total_params = 0
-    for param in sharpener.parameters():
-        total_params += param.numel()
+    pipe = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, torch_dtype=torch.float16)
+    noise_scheduler = copy.deepcopy(pipe.scheduler)
+    tokenizer = pipe.tokenizer
+    text_encoder = pipe.text_encoder
+    vae = pipe.vae
+    unet = pipe.unet
+    controlnet = ControlNetModel.from_unet(unet)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
+    controlnet.train().requires_grad_(True)
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -199,6 +174,7 @@ def main():
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
+            controlnet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -207,36 +183,23 @@ def main():
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                if args.use_ema:
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                i = len(weights) - 1
+                while len(weights) > 0:
+                    weights.pop()
+                    model = models[i]
 
-                # model.save_pretrained(os.path.join(output_dir, "unet"))
-                data = dict(model=accelerator.unwrap_model(sharpener))
+                    sub_dir = "controlnet"
+                    model.save_pretrained(os.path.join(output_dir, sub_dir))
 
-                with open(os.path.join(output_dir, f'sharpener-snapshot.pkl'), 'wb') as f:
-                    pickle.dump(data, f)
-
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+                    i -= 1
 
         def load_model_hook(models, input_dir):
-            if args.use_ema:
-                load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel, foreach=args.foreach_ema
-                )
-                ema_unet.load_state_dict(load_model.state_dict())
-                if args.offload_ema:
-                    ema_unet.pin_memory()
-                else:
-                    ema_unet.to(accelerator.device)
-                del load_model
-
-            for _ in range(len(models)):
+            while len(models) > 0:
                 # pop models so that they are not loaded again
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -246,7 +209,7 @@ def main():
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        controlnet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -271,7 +234,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        sharpener.parameters(),
+        controlnet.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -308,8 +271,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    sharpener, optimizer, dataset_iterator, lr_scheduler = accelerator.prepare(
-        sharpener, optimizer, dataset_iterator, lr_scheduler
+    controlnet, optimizer, dataset_iterator, lr_scheduler = accelerator.prepare(
+        controlnet, optimizer, dataset_iterator, lr_scheduler
     )
 
     if args.use_ema:
@@ -332,7 +295,7 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
-    sharpener.to(accelerator.device)
+    controlnet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(dataset_obj) * args.gradient_accumulation_steps / (accelerator.num_processes * args.train_batch_size))
@@ -363,7 +326,6 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Total parameters of DICE sharpener = {total_params}")
     global_step = 0
 
     # Potentially load in the weights and states from a previous save
@@ -396,6 +358,10 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
+    
+    pipeline = pipe.to(accelerator.device)
+    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.set_progress_bar_config(disable=True)
 
     # Get the null text embedding
     with torch.no_grad():
@@ -405,7 +371,7 @@ def main():
     
     if accelerator.is_main_process:
         with torch.no_grad():
-            log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, sharpener, global_step)
+            log_validation(pipeline, controlnet, args, accelerator, global_step)
 
     # Training loop
     train_loss = 0.0
@@ -421,8 +387,10 @@ def main():
                 device=accelerator.device
             ).reshape(-1,).repeat(args.train_batch_size,)
             timesteps = timesteps.long()
+            cfg_scale = 12 * next(rg.rand()) + 2 if args.guidance_scale is None else args.guidance_scale
+            cfg_condition = cfg_scale * torch.ones((args.train_batch_size, 3, 512, 512), device=accelerator.device)
 
-        with accelerator.accumulate(sharpener):
+        with accelerator.accumulate(controlnet):
             with torch.no_grad():
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
@@ -439,19 +407,31 @@ def main():
 
                 # Predict the noise residual and compute loss
                 with torch.autocast('cuda'):
-                    target = unet(torch.cat([noisy_latents] * 2), torch.cat([timesteps] * 2), torch.cat([uc, c]), return_dict=False)[0]
+                    target = unet(torch.cat([noisy_latents] * 2), torch.cat([timesteps] * 2), torch.cat([uc_neg if args.use_neg else uc, c]), return_dict=False)[0]
                     target_uncond, target_text = target.chunk(2)
-                    target = target_uncond + args.guidance_scale * (target_text - target_uncond)
+                    target = target_uncond + cfg_scale * (target_text - target_uncond)
 
-            # Get the enhanced text embedding
-            c_learn = c + sharpener(c, uc)
-            c_learn[:,0] = c[:,0]       # Keep the <SOS> token unchanged
-
+            # Compute loss
             with torch.autocast('cuda'):
-                # Compute loss
-                model_pred = unet(noisy_latents, timesteps, c_learn, return_dict=False)[0]
-                loss = (model_pred - target).abs().sum().mul(1 / total_batch_size)
-                # loss = ((model_pred - target)**2).sum().mul(1 / total_batch_size)
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=c,
+                    controlnet_cond=cfg_condition,
+                    return_dict=False,
+                )
+
+                model_pred = unet(
+                    noisy_latents, 
+                    timesteps, 
+                    c, 
+                    down_block_additional_residuals=[
+                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                    ],
+                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    return_dict=False, 
+                )[0]
+                loss = ((model_pred - target)**2).sum().mul(1 / total_batch_size)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -462,11 +442,12 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
 
+
             optimizer.zero_grad()
 
         if accelerator.is_main_process:
             logger.info(f"Global: {global_step+1}/{args.max_train_steps} | Loss: {avg_loss.item():8.4f}")
-        
+
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.sync_gradients:
             if args.use_ema:
@@ -504,7 +485,7 @@ def main():
                 logger.info(f"Saved state to {save_path}")
 
                 with torch.no_grad():
-                    log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, sharpener, global_step)
+                    log_validation(pipeline, controlnet, args, accelerator, global_step)
         
         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
@@ -516,27 +497,12 @@ def main():
 
 #----------------------------------------------------------------------------
 
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, sharpener, global_step):
-    sharpener.eval()
+@torch.no_grad()
+def log_validation(pipeline, controlnet, args, accelerator, global_step):
     logger.info("Running validation... ")
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=accelerator.unwrap_model(vae),
-        text_encoder=accelerator.unwrap_model(text_encoder),
-        tokenizer=tokenizer,
-        unet=accelerator.unwrap_model(unet),
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
+    controlnet.eval()
+    pipeline.controlnet = accelerator.unwrap_model(controlnet)
 
     # Save images
     args.validation_prompts = [
@@ -550,27 +516,26 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
 
     with torch.autocast('cuda'):
         if global_step == 0:
-            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=args.guidance_scale).images
+            pipeline.gd_scale = None
+            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=5).images
             images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
             images = make_grid(images, nrow=4, padding=0)
-            save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg{args.guidance_scale}.png"))
+            save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg5.png"))
 
             images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=1).images
             images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
             images = make_grid(images, nrow=4, padding=0)
             save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg1.png"))
         else:
-            pipeline.sharpener = sharpener
-            pipeline.sharpener_alpha = 1
-            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator).images
+            pipeline.gd_scale = 5
+            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=1).images
             images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
             images = make_grid(images, nrow=4, padding=0)
-            save_image(images, os.path.join(args.project_dir, 'images', f"grid_dice_{global_step}.png"))
-
-    del pipeline
+            save_image(images, os.path.join(args.project_dir, 'images', f"grid_pnp_{global_step}.png"))
+   
     torch.cuda.empty_cache()
 
-    sharpener.train()
+    controlnet.train()
     return images
 
 

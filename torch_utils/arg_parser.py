@@ -305,7 +305,7 @@ def parse_args():
     )
 
     parser.add_argument("--n_gpus", type=int, default=1, help="Number of GPUs.")
-    parser.add_argument("--guidance_scale", type=float, default=5, help="Teacher guidance scale.")
+    parser.add_argument("--guidance_scale", type=float, help="Teacher guidance scale.")
     parser.add_argument("--use_neg", action="store_true", help="Whether to train with negative prompts.")
 
 

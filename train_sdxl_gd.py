@@ -38,7 +38,12 @@ from transformers import AutoTokenizer, PretrainedConfig
 from transformers.utils import ContextManagers
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DPMSolverMultistepScheduler, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL, 
+    DDPMScheduler, 
+    DPMSolverMultistepScheduler, 
+    UNet2DConditionModel
+)
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -46,12 +51,12 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import re
 import pickle
-from dice_sharpener import Sharpener
 from torchvision.utils import make_grid, save_image
 from pipelines.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
 from torch_utils.arg_parser import parse_args
 from torch_utils.dataset import COCODataset, InfiniteSampler
 from datasets import load_dataset
+from unets.unet_2d_condition_gd import UNet2DConditionModelGD
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.33.0.dev0")
@@ -146,7 +151,9 @@ def main():
 
     # Description string.
     total_batch_size = args.train_batch_size * args.n_gpus * args.gradient_accumulation_steps
-    desc = f'sdxl-{args.max_train_steps}-batch{total_batch_size}-cfg{args.guidance_scale}'
+    desc = f'sdxl-{args.max_train_steps}-batch{total_batch_size}'
+    if args.guidance_scale is not None: desc += f'-cfg{args.guidance_scale}'
+    desc += '-gd'
     prev_run_dirs = []
     if os.path.isdir(args.output_dir):
         prev_run_dirs = [x for x in os.listdir(args.output_dir) if os.path.isdir(os.path.join(args.output_dir, x))]
@@ -168,7 +175,7 @@ def main():
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
-
+    
     # Handle the repository creation
     if args.project_dir is not None:
         os.makedirs(args.project_dir, exist_ok=True)
@@ -228,24 +235,21 @@ def main():
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        'madebyollin/sdxl-vae-fp16-fix', torch_dtype=torch.float16
     )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    unet_tea = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant,
     )
-
-    sharpener = Sharpener(input_dim=2048, output_dim=2048, inner_dim=512, nhead=8)
-    sharpener.train().requires_grad_(True)
-    # Check model parameters
-    total_params = 0
-    for param in sharpener.parameters():
-        total_params += param.numel()
+    unet = UNet2DConditionModelGD.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant, low_cpu_mem_usage=False, device_map=None,
+    )
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
-    unet.requires_grad_(False)
+    unet_tea.requires_grad_(False)
+    unet.train().requires_grad_(True)
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -281,9 +285,9 @@ def main():
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
                 # model.save_pretrained(os.path.join(output_dir, "unet"))
-                data = dict(model=accelerator.unwrap_model(sharpener))
+                data = dict(model=accelerator.unwrap_model(unet))
 
-                with open(os.path.join(output_dir, f'sharpener-snapshot.pkl'), 'wb') as f:
+                with open(os.path.join(output_dir, f'model-snapshot.pkl'), 'wb') as f:
                     pickle.dump(data, f)
 
                 # make sure to pop weight so that corresponding model is not saved again
@@ -341,7 +345,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        sharpener.parameters(),
+        unet.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -372,8 +376,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    sharpener, optimizer, dataset_iterator, lr_scheduler = accelerator.prepare(
-        sharpener, optimizer, dataset_iterator, lr_scheduler
+    unet, optimizer, dataset_iterator, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataset_iterator, lr_scheduler
     )
 
     if args.use_ema:
@@ -397,8 +401,8 @@ def main():
     # vae.to(accelerator.device, dtype=torch.float32)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    unet_tea.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
-    sharpener.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(dataset_obj) * args.gradient_accumulation_steps / (accelerator.num_processes * args.train_batch_size))
@@ -429,7 +433,6 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Total parameters of DICE sharpener = {total_params}")
     global_step = 0
 
     # Potentially load in the weights and states from a previous save
@@ -472,6 +475,25 @@ def main():
     )
     compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
 
+    pipeline = StableDiffusionXLPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder_one),
+        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+        tokenizer=tokenizer_one,
+        tokenizer_2=tokenizer_two,
+        unet=accelerator.unwrap_model(unet),
+        safety_checker=None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.set_progress_bar_config(disable=True)
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
     # Get the null text embedding
     with torch.no_grad():
         uc = compute_embeddings_fn([''] * args.train_batch_size)
@@ -482,7 +504,7 @@ def main():
     
     if accelerator.is_main_process:
         with torch.no_grad():
-            log_validation(vae, text_encoder_one, text_encoder_two, tokenizer_one, tokenizer_two, unet, args, accelerator, weight_dtype, sharpener, global_step)
+            log_validation(pipeline, unet, args, accelerator, global_step)
 
     def compute_time_ids(original_size, crops_coords_top_left):
         # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
@@ -504,18 +526,16 @@ def main():
                 device=accelerator.device
             ).reshape(-1,).repeat(args.train_batch_size,)
             timesteps = timesteps.long()
+            cfg_scale = 12 * next(rg.rand()) + 2 if args.guidance_scale is None else args.guidance_scale
+            cfg_condition = torch.tensor(cfg_scale, device=accelerator.device).reshape(-1,).repeat(args.train_batch_size,).long()
 
-        with accelerator.accumulate(sharpener):
+        with accelerator.accumulate(unet):
             with torch.no_grad():
                 # Convert images to latent space
                 latents = compute_vae_encodings_fn(images.to(weight_dtype))
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
-
-                # Sample a random timestep for each image
-                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)
-                # timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -534,7 +554,7 @@ def main():
                     {"text_embeds": torch.cat([uc_pooled_prompt_embeds, c_pooled_prompt_embeds])}
                 )
                 with torch.autocast('cuda'):
-                    target = unet(
+                    target = unet_tea(
                         torch.cat([noisy_latents] * 2), 
                         torch.cat([timesteps] * 2),
                         torch.cat([uc_prompt_embeds, c_prompt_embeds]),
@@ -542,17 +562,13 @@ def main():
                         return_dict=False
                     )[0]
                     target_uncond, target_text = target.chunk(2)
-                    target = target_uncond + args.guidance_scale * (target_text - target_uncond)
-
-            # Get the enhanced text embedding
-            c_learn = c_prompt_embeds + sharpener(c_prompt_embeds, uc_prompt_embeds)
-            c_learn[:,0] = c_prompt_embeds[:,0]       # Keep the <SOS> token unchanged
+                    target = target_uncond + cfg_scale * (target_text - target_uncond)
 
             # Compute loss
             unet_added_conditions = {"time_ids": add_time_ids}
             unet_added_conditions.update({"text_embeds": c_pooled_prompt_embeds})
             with torch.autocast('cuda'):
-                model_pred = unet(noisy_latents, timesteps, c_learn, added_cond_kwargs=unet_added_conditions, return_dict=False)[0]
+                model_pred = unet(noisy_latents, timesteps, c_prompt_embeds, added_cond_kwargs=unet_added_conditions, return_dict=False, cfg_condition=cfg_condition)[0]
                 # loss = (model_pred - target).abs().sum().mul(1 / total_batch_size)
                 loss = ((model_pred - target)**2).sum().mul(1 / total_batch_size)
                 # Backpropagate
@@ -603,7 +619,7 @@ def main():
                 logger.info(f"Saved state to {save_path}")
 
                 with torch.no_grad():
-                    log_validation(vae, text_encoder_one, text_encoder_two, tokenizer_one, tokenizer_two, unet, args, accelerator, weight_dtype, sharpener, global_step)
+                    log_validation(pipeline, unet, args, accelerator, global_step)
         
         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
@@ -615,62 +631,45 @@ def main():
 
 #----------------------------------------------------------------------------
 
-def log_validation(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, unet, args, accelerator, weight_dtype, sharpener, global_step):
-    sharpener.eval()
+@torch.no_grad()
+def log_validation(pipeline, unet, args, accelerator, global_step):
     logger.info("Running validation... ")
 
-    pipeline = StableDiffusionXLPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=accelerator.unwrap_model(vae),
-        text_encoder=accelerator.unwrap_model(text_encoder),
-        text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-        tokenizer=tokenizer,
-        tokenizer_2=tokenizer_2,
-        unet=accelerator.unwrap_model(unet),
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
+    unet.eval()
+    pipeline.unet = accelerator.unwrap_model(unet)
 
     # Save images
     args.validation_prompts = [
         'Photo portrait of a cute girl, sunshine',
-        'A beautiful landscape, mountain, cloud, lake',
+        # 'A beautiful landscape, mountain, cloud, lake',
         'A corgi wearing sunglasses on the beach',
-        'A sports car running on the road'
+        # 'A sports car running on the road'
     ]
     generator = torch.Generator(device=accelerator.device).manual_seed(0)
     os.makedirs(os.path.join(args.project_dir, 'images'), exist_ok=True)
 
-    if global_step == 0:
-        images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=args.guidance_scale).images
-        images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
-        images = make_grid(images, nrow=4, padding=0)
-        save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg{args.guidance_scale}.png"))
+    with torch.autocast('cuda'):
+        if global_step == 0:
+            pipeline.gd_scale = None
+            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=1, generator=generator, guidance_scale=5).images
+            images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
+            images = make_grid(images, nrow=4, padding=0)
+            save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg5.png"))
 
-        images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator, guidance_scale=1).images
-        images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
-        images = make_grid(images, nrow=4, padding=0)
-        save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg1.png"))
-    else:
-        pipeline.sharpener = sharpener
-        pipeline.sharpener_alpha = 1
-        images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=2, generator=generator).images
-        images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
-        images = make_grid(images, nrow=4, padding=0)
-        save_image(images, os.path.join(args.project_dir, 'images', f"grid_dice_{global_step}.png"))
+            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=1, generator=generator, guidance_scale=1).images
+            images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
+            images = make_grid(images, nrow=4, padding=0)
+            save_image(images, os.path.join(args.project_dir, 'images', f"grid_cfg1.png"))
+        else:
+            pipeline.gd_scale = 5
+            images = pipeline(args.validation_prompts, num_inference_steps=10, num_images_per_prompt=1, generator=generator, guidance_scale=1).images
+            images = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).float() / 255
+            images = make_grid(images, nrow=4, padding=0)
+            save_image(images, os.path.join(args.project_dir, 'images', f"grid_gd_{global_step}.png"))
 
-    del pipeline
     torch.cuda.empty_cache()
 
-    sharpener.train()
+    unet.train()
     return images
 
 

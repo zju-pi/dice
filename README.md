@@ -15,7 +15,7 @@ Text-to-image diffusion models are capable of generating high-quality images, bu
 
 
 ## Getting Started
-Run the commands in [launch.sh](./launch.sh) for training, sampling and evaluation with recommended settings. 
+Run the commands in [launch_dice.sh](./scripts/launch_dice.sh) for training, sampling and evaluation with recommended settings. We also provide the training scripts of our re-implementation for [Guided Distillation (GD)](http://arxiv.org/abs/2210.03142) and [Plug-and-Play Distillation (PnP)](http://arxiv.org/abs/2406.01954) in [launch_gd.sh](./scripts/launch_gd.sh) and [launch_pnp.sh](./scripts/launch_pnp.sh).
 We use 8 A100 GPUs for all experiments. Feel free to modify the default settings according to your available devices.
 
 ### Training
@@ -27,7 +27,7 @@ MODEL_NAME="Lykon/DreamShaper"
 n_gpus=8
 acc_steps=1
 num_updates=8000
-accelerate launch --num_processes=$n_gpus --mixed_precision="fp16" train_sd15.py \
+accelerate launch --num_processes=$n_gpus --mixed_precision="bf16" train_sd15.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --enable_xformers_memory_efficient_attention \
   --gradient_accumulation_steps=$acc_steps \
@@ -42,26 +42,29 @@ accelerate launch --num_processes=$n_gpus --mixed_precision="fp16" train_sd15.py
 ```
 
 ### Sampling and Evaluation
-The trained DICE sharpener is saved in the `./exps` directory with a five-digit experiment ID (e.g., `00003`). It can be directly used during sampling by specifying `--sharpener_path=3` (see the example below). 
+The trained DICE sharpener is saved in the `./exps` directory with a five-digit experiment ID (e.g., `00003`). It can be directly used during sampling by specifying `--model_path=3` (see the example below). 
 
 ```.bash
 # Sampling using trained DICE sharpener
+n_gpus=8
 model_name="sd15"
-sharpener_path=3
-sharpener_id=$sharpener_path
+model_path=3
+model_id=$model_path
+method="dice"
 steps=20
 alpha=1.0
 batch_gpu=16
-accelerate launch --num_processes=8 sample.py --model_name=$model_name --sharpener_path=$sharpener_path --sharpener_id=$sharpener_id --steps=$steps --alpha=$alpha --batch_gpu=$batch_gpu;
+accelerate launch --num_processes=$n_gpus sample.py --model_name=$model_name --model_path=$model_path --model_id=$model_id --steps=$steps --alpha=$alpha --batch_gpu=$batch_gpu;
 
 # Evaluation using FID, CLIP score and Aeathetic score
-out_folder="${model_name}_${sharpener_id}_steps${steps}_alpha${alpha}"
+n_gpus=8
+out_folder="${model_name}_${method}_${model_id}_steps${steps}_alpha${alpha}"
 image_path="./samples/${out_folder}"
 ref="/Path/to/reference/statistis"
 desc="${out_folder}"
-accelerate launch --num_processes=8 ./evaluation/eval_fid.py calc --images=$image_path --ref=$ref --desc=$desc;
-accelerate launch --num_processes=8 ./evaluation/eval_clip_score.py calc --images=$image_path --desc=$desc;
-accelerate launch --num_processes=8 ./evaluation/eval_aes_score.py calc --images=$image_path --desc=$desc;
+accelerate launch --num_processes=$n_gpus ./evaluation/eval_fid.py calc --images=$image_path --ref=$ref --desc=$desc;
+accelerate launch --num_processes=$n_gpus ./evaluation/eval_clip_score.py calc --images=$image_path --desc=$desc;
+accelerate launch --num_processes=$n_gpus ./evaluation/eval_aes_score.py calc --images=$image_path --desc=$desc;
 ```
 
 ## Performance
